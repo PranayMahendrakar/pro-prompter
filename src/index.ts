@@ -6,10 +6,10 @@
  * How the "zero credits" trick works:
  *   An MCP server on Claude/ChatGPT cannot call an LLM itself (sampling is
  *   unsupported in 2026), and it can't intercept your message before the AI
- *   reads it. So Pro Prompter doesn't run any AI of its own. Instead, each tool
- *   returns a world-class *meta-prompt* (pure text, instant, free). The host
- *   model — the Claude/ChatGPT you're already talking to — reads that text and
- *   does the rewriting + answering in the SAME turn. No API key, no extra bill.
+ *   reads it. So Pro Prompter runs no AI of its own. Each tool returns a
+ *   compact, world-class *meta-prompt* (pure text, instant, free). The host
+ *   model — the Claude/ChatGPT you're already talking to — reads it and does
+ *   the rewriting + answering in the SAME turn. No API key, no extra bill.
  *
  * Interfaces:
  *   Tool  pro_prompt     -> engineer the prompt AND execute it (refine + run)
@@ -18,10 +18,9 @@
  *   Tool  clear_memory   -> wipe this session's memory
  *   Prompt pro_prompt    -> Claude-only slash-command version of refine + run
  *
- * Endpoints once deployed:
- *   GET  /      -> landing page
- *   POST /mcp   -> Streamable HTTP (use this URL in Claude & ChatGPT)
- *        /sse   -> legacy SSE transport
+ * The rubric is intentionally lean (token economy) and specialized per task:
+ * a request is classified into one of 15 task types, each of which injects its
+ * own expert "must-specify" checklist.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -33,93 +32,264 @@ interface Env {
 }
 
 // ---------------------------------------------------------------------------
-// The FAANG-grade rubric, distilled from Anthropic + OpenAI official guidance.
-// This is the "intelligence" Pro Prompter injects; the host model applies it.
+// Task-type specs — expert, token-economical checklists (one per task type).
+// A request is scored against each spec's keywords; the best match wins.
 // ---------------------------------------------------------------------------
-const RUBRIC = `RUBRIC — include only the parts that add signal; add structure, never padding:
-• Role — one line, only if it shifts expertise or tone.
-• Context + why — the minimum background PLUS the motivation, stated once (the model generalizes from the "why").
-• Task — one precise, action-verb objective with a clear definition of "done".
-• Steps — numbered only when order or completeness matters.
-• Constraints — phrased positively ("do X", not "don't do Y"), with zero contradictions.
-• Output format — the exact structure/shape expected back (name the tags or schema).
-• Examples — none by default; add 1–3 diverse, relevant ones only if format or edge-cases are hard to convey in words.
-• Success criteria — the quality bar plus a final self-check.`;
+type TaskSpec = { key: string; label: string; keywords: string[]; dimensions: string[] };
 
-const NON_NEGOTIABLES = `NON-NEGOTIABLES:
-• Preserve every detail, constraint, and {variable} from the raw request verbatim — never drop or invent requirements.
-• Keep it information-dense: shorter is better whenever fidelity holds. No filler, no ALL-CAPS "CRITICAL/MUST" over-prompting.`;
+const TASK_SPECS: TaskSpec[] = [
+  {
+    key: "coding", label: "coding",
+    keywords: ["code", "function", "bug", "debug", "refactor", "implement", "api", "class", "script", "compile", "endpoint", "algorithm", "stack trace", "typescript", "python"],
+    dimensions: [
+      "State the exact goal and acceptance criteria",
+      "Specify language, version, framework, and dependencies",
+      "Give codebase context, files, and interfaces",
+      "Define inputs, outputs, edge cases, and errors",
+      "Set performance, security, and style constraints",
+      "Require tests and verification steps",
+      "Specify output format: diff vs full files",
+    ],
+  },
+  {
+    key: "data", label: "data",
+    keywords: ["sql", "query", "csv", "dataframe", "pandas", "spreadsheet", "excel", "chart", "pivot", "aggregate", "group by", "visualize", "columns"],
+    dimensions: [
+      "Describe the input data: schema, types, sample rows",
+      "State the exact goal, metric, or question",
+      "Name the engine and dialect (SQL flavor, pandas, Excel)",
+      "Specify output shape: columns, format, chart type",
+      "Define grain, filters, grouping, and time window",
+      "Set null, dedup, and edge-case handling",
+    ],
+  },
+  {
+    key: "math", label: "math / logic",
+    keywords: ["solve", "prove", "theorem", "equation", "integral", "derivative", "probability", "combinatorics", "algebra", "calculus", "inequality", "word problem", "compute", "how many", "optimization"],
+    dimensions: [
+      "State the exact problem, givens, and unknown",
+      "Specify rigor: full proof vs final answer",
+      "Demand step-by-step derivation, no skipped algebra",
+      "Fix answer format, units, and precision",
+      "Require a verification / sanity-check of the result",
+      "Name allowed methods, theorems, or constraints",
+    ],
+  },
+  {
+    key: "extraction", label: "data extraction",
+    keywords: ["extract", "parse", "structured data", "json", "fields", "schema", "key-value", "scrape", "pull out", "normalize", "entities", "table to json"],
+    dimensions: [
+      "Provide the source text / input verbatim",
+      "Define the exact output schema, field names, and types",
+      "Specify handling for missing or ambiguous values",
+      "State output format and strict serialization rules",
+      "Give per-field normalization (dates, units, casing)",
+      "Constrain to the source; forbid inference or fabrication",
+    ],
+  },
+  {
+    key: "translation", label: "translation",
+    keywords: ["translate", "translation", "localize", "localization", "l10n", "i18n", "into spanish", "into french", "target language", "source language", "locale", "transcreate", "subtitle", "bilingual", "multilingual"],
+    dimensions: [
+      "Name source and target languages plus locale",
+      "Specify register, tone, and target audience",
+      "State domain and subject-matter terminology",
+      "Set depth: literal vs adapt idioms and units",
+      "Supply glossary, brand terms, do-not-translate list",
+      "Define formatting, placeholder, and markup handling",
+    ],
+  },
+  {
+    key: "image", label: "image generation",
+    keywords: ["image", "picture", "photo", "illustration", "render", "artwork", "midjourney", "dall-e", "stable diffusion", "generate an image", "poster", "logo", "concept art", "portrait", "aspect ratio"],
+    dimensions: [
+      "Name subject, count, and defining attributes",
+      "State style, medium, or artistic reference",
+      "Specify composition, shot framing, and angle",
+      "Define lighting, mood, and color palette",
+      "Set setting, background, and environment detail",
+      "Give aspect ratio, resolution, and quality",
+      "List exclusions via negatives / constraints",
+    ],
+  },
+  {
+    key: "design", label: "design",
+    keywords: ["design", "ui", "ux", "landing page", "website", "layout", "wireframe", "mockup", "dashboard", "web design", "responsive", "figma", "hero section", "typography", "redesign"],
+    dimensions: [
+      "State goal, target audience, and brand personality",
+      "Specify platform, viewport, and responsive breakpoints",
+      "Name the visual style with reference examples",
+      "Define color palette, typography, and spacing",
+      "Map sections, content hierarchy, and primary CTA",
+      "Set output format, tech stack, and fidelity",
+      "Require accessibility and component states",
+    ],
+  },
+  {
+    key: "research", label: "research",
+    keywords: ["research", "find sources", "cite", "citations", "literature review", "market scan", "evidence", "state of the art", "fact-check", "landscape", "survey", "who are the", "statistics"],
+    dimensions: [
+      "State the precise question and scope boundaries",
+      "Require citations with source-credibility and recency limits",
+      "Set time-frame, geography, and domain filters",
+      "Define output structure, length, and comparison format",
+      "Specify depth, breadth, and minimum source count",
+      "Demand flagging of gaps, conflicts, and uncertainty",
+    ],
+  },
+  {
+    key: "strategy", label: "strategy",
+    keywords: ["strategy", "roadmap", "go-to-market", "gtm", "prioritize", "trade-off", "tradeoff", "positioning", "business model", "market entry", "competitive advantage", "pricing strategy", "monetization", "build vs buy", "okrs"],
+    dimensions: [
+      "State company, market, stage, and hard constraints",
+      "Frame the decision and the alternatives",
+      "Define objectives, success metrics, and time horizon",
+      "Give prioritization criteria and risk tolerance",
+      "Supply key data, assumptions, and open unknowns",
+      "Specify the deliverable: recommendation, rationale, trade-offs",
+    ],
+  },
+  {
+    key: "marketing", label: "marketing",
+    keywords: ["ad", "ads", "campaign", "headline", "cta", "social post", "tweet", "newsletter", "launch", "growth", "conversion", "brand voice", "landing page copy"],
+    dimensions: [
+      "Name target audience, pain, and awareness stage",
+      "State product, value prop, and differentiator",
+      "Specify channel, format, and length limits",
+      "Define objective, CTA, and success metric",
+      "Set brand voice, tone, and forbidden claims",
+      "Provide proof points, offer, and hook angle",
+      "Request the number of variants and output structure",
+    ],
+  },
+  {
+    key: "analysis", label: "analysis",
+    keywords: ["analyze", "analysis", "compare", "comparison", "evaluate", "evaluation", "assess", "critique", "pros and cons", "trade-offs", "recommend", "versus", "vs", "weigh options", "should i", "which is better"],
+    dimensions: [
+      "State the decision or question and desired verdict",
+      "List options and evaluation criteria with weights",
+      "Provide context, constraints, and success goals",
+      "Set audience, depth, and output format",
+      "Demand evidence, reasoning, and trade-off transparency",
+      "Require an explicit recommendation with caveats and risks",
+    ],
+  },
+  {
+    key: "planning", label: "planning",
+    keywords: ["plan", "roadmap", "schedule", "timeline", "milestones", "project plan", "phases", "task breakdown", "gantt", "sprint", "backlog", "deadline", "action plan", "workback"],
+    dimensions: [
+      "State goal, scope, and success criteria",
+      "Give timeframe, start date, and hard deadlines",
+      "List resources, team, budget, and constraints",
+      "Name dependencies, risks, and assumptions",
+      "Specify output format and task granularity",
+      "Define milestones, checkpoints, and non-goals",
+    ],
+  },
+  {
+    key: "tutoring", label: "tutoring / explaining",
+    keywords: ["explain", "teach", "learn", "understand", "tutor", "concept", "eli5", "walk me through", "beginner", "intuition", "how does", "simplify", "break down", "lesson"],
+    dimensions: [
+      "State learner level and prior knowledge",
+      "Define the learning goal and target depth",
+      "Request analogies, concrete examples, step-by-step buildup",
+      "Specify format, length, and structure",
+      "Include comprehension checks or practice questions",
+      "Flag common misconceptions and pitfalls",
+    ],
+  },
+  {
+    key: "summarization", label: "summarization",
+    keywords: ["summarize", "summary", "tldr", "tl;dr", "condense", "recap", "abstract", "digest", "key points", "gist", "shorten", "synopsis", "boil down", "takeaways"],
+    dimensions: [
+      "State the target length or compression ratio",
+      "Specify output format (bullets, prose, structured)",
+      "Define the audience and purpose",
+      "Name must-keep elements and the focus",
+      "Set fidelity: source-only, add no new facts",
+      "Say whether to preserve key quotes or numbers",
+    ],
+  },
+  {
+    key: "writing", label: "writing",
+    keywords: ["write", "essay", "article", "blog", "email", "story", "copy", "draft", "rewrite", "newsletter", "prose", "narrative", "tagline", "caption", "letter", "post"],
+    dimensions: [
+      "Define audience, purpose, and desired reader action",
+      "Set voice, tone, and reading level",
+      "Specify format, length, and structure",
+      "Provide key points, facts, and sources",
+      "Give the context, angle, or core message",
+      "State constraints: banned words, must-includes, CTA",
+    ],
+  },
+];
 
-type Analysis = {
-  taskType: string;
-  taskHint: string;
-  complexityNote: string;
-};
-
-function analyze(request: string): Analysis {
-  const t = request.toLowerCase();
-  const wordCount = (request.match(/\S+/g) ?? []).length;
-
-  let taskType = "general";
-  let taskHint = "";
-  if (/\b(code|function|bug|api|script|program|regex|sql|python|javascript|typescript|react|component|refactor|debug|algorithm)\b/.test(t)) {
-    taskType = "code";
-    taskHint = "TASK-SPECIFIC: specify language/framework, inputs & outputs, constraints, edge cases, and that the code must be complete and runnable.";
-  } else if (/\b(write|essay|blog|email|article|story|poem|copy|caption|tweet|post|letter|script|newsletter)\b/.test(t)) {
-    taskType = "writing";
-    taskHint = "TASK-SPECIFIC: specify audience, tone, length, format, and the piece's purpose.";
-  } else if (/\b(design|landing page|website|ui|ux|logo|layout|mockup|brand|figma)\b/.test(t)) {
-    taskType = "design";
-    taskHint = "TASK-SPECIFIC: specify audience, style/brand, required sections, responsiveness, and the deliverable format.";
-  } else if (/\b(analyz|analyse|compare|evaluate|research|summar|assess|pros and cons|explain|review)\b/.test(t)) {
-    taskType = "analysis";
-    taskHint = "TASK-SPECIFIC: specify the analytical framework, the dimensions to cover, evidence expectations, and the output structure.";
-  } else if (/\b(data|table|csv|chart|graph|dataset|spreadsheet|plot|metric)\b/.test(t)) {
-    taskType = "data";
-    taskHint = "TASK-SPECIFIC: specify the input shape, the exact computation/transformation, and the output format.";
-  }
-
-  const complex = wordCount > 12 || /\b(detailed|comprehensive|production|step by step|in depth|thorough|complex|architecture|end.to.end)\b/.test(t);
-  const complexityNote = complex
-    ? "This is a non-trivial request — apply the full rubric wherever it adds value."
-    : "This looks like a simple request — keep the engineered prompt minimal (role + clear task + output format). Do NOT over-engineer it.";
-
-  return { taskType, taskHint, complexityNote };
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function reasoningDirective(modelClass: string): string {
-  if (modelClass === "chat") {
-    return 'REASONING: if the task needs multi-step logic/math, instruct the model to reason inside <thinking> tags and give the final answer in <answer> tags.';
+function detect(request: string): TaskSpec | null {
+  const t = request.toLowerCase();
+  let best: TaskSpec | null = null;
+  let bestScore = 0;
+  for (const spec of TASK_SPECS) {
+    let score = 0;
+    for (const kw of spec.keywords) {
+      if (new RegExp(`\\b${escapeRe(kw)}\\b`, "i").test(t)) score++;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = spec;
+    }
   }
-  // auto + reasoning: modern hosts (Claude Opus, GPT-5) reason internally.
-  return 'REASONING: treat the executing model as a reasoning model — do NOT add "think step by step"; give it the goal, constraints, and success criteria and let it reason internally.';
+  return bestScore > 0 ? best : null;
+}
+
+function isComplex(request: string): boolean {
+  const wc = (request.match(/\S+/g) ?? []).length;
+  return wc > 12 || /\b(detailed|comprehensive|production|in depth|thorough|complex|architecture|end.to.end|step by step)\b/i.test(request);
+}
+
+const CORE =
+  'CORE — set a role only if it changes behavior; give context + the "why" once; one precise action-verb task with a clear "done"; positive constraints, no contradictions; explicit output format; examples only if format/edge-cases need them; success criteria + a self-check.';
+
+function reasoningLine(modelClass: string): string {
+  return modelClass === "chat"
+    ? "REASONING — for multi-step logic, reason inside <thinking> tags, then answer in <answer> tags."
+    : "REASONING — the executor is a reasoning model: give goal + constraints + success criteria; do NOT add \"think step by step\".";
+}
+
+function taskBlock(spec: TaskSpec | null): string {
+  if (!spec) return "";
+  const bullets = spec.dimensions.map((d) => `  • ${d}`).join("\n");
+  return `FOR THIS ${spec.label.toUpperCase()} TASK, make the prompt nail:\n${bullets}\n`;
+}
+
+function complexityGuard(request: string): string {
+  return isComplex(request) ? "" : "This is a small ask — include only the checklist items that matter here and stay concise.\n";
 }
 
 function memoryBlock(history: string[]): string {
   if (history.length === 0) return "";
-  const lines = history.map((h) => `• ${h.length > 160 ? h.slice(0, 157) + "…" : h}`).join("\n");
-  return `SESSION CONTEXT — earlier requests in this session you may build on (most recent first):\n${lines}\n\n`;
+  const lines = history.map((h) => `  • ${h.length > 140 ? h.slice(0, 137) + "…" : h}`).join("\n");
+  return `SESSION CONTEXT — earlier requests you may build on (most recent first):\n${lines}\n\n`;
 }
 
 function buildRefineAndRun(request: string, modelClass: string, history: string[]): string {
-  const { taskHint, complexityNote } = analyze(request);
+  const spec = detect(request);
   return `🧠 PRO PROMPTER — engineer, then execute.
 
-You are an elite, FAANG-level prompt engineer AND the executor. Transform the RAW REQUEST below into ONE optimally-engineered prompt, then carry it out fully.
+Act as an elite, FAANG-level prompt engineer AND the executor. Rewrite the RAW REQUEST into ONE optimally-engineered prompt, then carry it out. Add structure and signal, never padding.
 
-${RUBRIC}
-${taskHint ? taskHint + "\n" : ""}${reasoningDirective(modelClass)}
+${CORE}
+${taskBlock(spec)}${reasoningLine(modelClass)}
+${complexityGuard(request)}Preserve every user detail and {variable} verbatim; invent nothing; keep it dense.
 
-${NON_NEGOTIABLES}
-• ${complexityNote}
-
-Respond in EXACTLY this shape:
-
+Reply in EXACTLY this shape:
 **🎯 Engineered prompt**
 <the rewritten prompt>
-
 **✅ Result**
-<now execute that engineered prompt in full, to the highest standard — no confirmation, no preamble>
+<execute the engineered prompt in full, to the highest standard — no preamble, no confirmation>
 
 ${memoryBlock(history)}RAW REQUEST
 <<<
@@ -128,18 +298,16 @@ ${request}
 }
 
 function buildRefineOnly(request: string, modelClass: string): string {
-  const { taskHint, complexityNote } = analyze(request);
+  const spec = detect(request);
   return `🧠 PRO PROMPTER — engineer only (do not execute).
 
-You are an elite, FAANG-level prompt engineer. Rewrite the RAW REQUEST below into ONE optimally-engineered prompt.
+Act as an elite, FAANG-level prompt engineer. Rewrite the RAW REQUEST into ONE optimally-engineered prompt.
 
-${RUBRIC}
-${taskHint ? taskHint + "\n" : ""}${reasoningDirective(modelClass)}
+${CORE}
+${taskBlock(spec)}${reasoningLine(modelClass)}
+${complexityGuard(request)}Preserve every user detail and {variable} verbatim; invent nothing; keep it dense.
 
-${NON_NEGOTIABLES}
-• ${complexityNote}
-
-Output ONLY the engineered prompt — ready to copy and reuse. Do NOT execute it, and add no commentary before or after.
+Output ONLY the engineered prompt — ready to copy and reuse. Do NOT execute it, and add no commentary.
 
 RAW REQUEST
 <<<
@@ -153,17 +321,15 @@ const MODEL_CLASS = z
   .describe('Executing model class. "reasoning" (Claude Opus / GPT-5 / o-series) skips chain-of-thought; "chat" adds it. Default "auto" = reasoning.');
 
 export class ProPrompter extends McpAgent {
-  server = new McpServer({
-    name: "Pro Prompter",
-    version: "1.0.0",
-  });
+  server = new McpServer({ name: "Pro Prompter", version: "1.1.0" });
 
   private ensureTable() {
     this.sql`CREATE TABLE IF NOT EXISTS prompt_history (id TEXT PRIMARY KEY, ts INTEGER, request TEXT, task_type TEXT)`;
   }
 
-  private remember(request: string, taskType: string) {
+  private remember(request: string) {
     this.ensureTable();
+    const taskType = detect(request)?.key ?? "general";
     this.sql`INSERT INTO prompt_history (id, ts, request, task_type) VALUES (${crypto.randomUUID()}, ${Date.now()}, ${request}, ${taskType})`;
   }
 
@@ -176,7 +342,6 @@ export class ProPrompter extends McpAgent {
   async init() {
     this.ensureTable();
 
-    // -------- Tool 1: refine + run (the main event) --------
     this.server.registerTool(
       "pro_prompt",
       {
@@ -193,12 +358,11 @@ export class ProPrompter extends McpAgent {
       async ({ request, model_class, use_memory }) => {
         const history = use_memory === false ? [] : this.recentRequests(3);
         const text = buildRefineAndRun(request, model_class ?? "auto", history);
-        this.remember(request, analyze(request).taskType);
+        this.remember(request);
         return { content: [{ type: "text", text }] };
       },
     );
 
-    // -------- Tool 2: refine only (return the polished prompt) --------
     this.server.registerTool(
       "refine_prompt",
       {
@@ -213,12 +377,11 @@ export class ProPrompter extends McpAgent {
       },
       async ({ request, model_class }) => {
         const text = buildRefineOnly(request, model_class ?? "auto");
-        this.remember(request, analyze(request).taskType);
+        this.remember(request);
         return { content: [{ type: "text", text }] };
       },
     );
 
-    // -------- Tool 3: recall session memory --------
     this.server.registerTool(
       "recall_prompts",
       {
@@ -228,7 +391,7 @@ export class ProPrompter extends McpAgent {
         annotations: { readOnlyHint: true, openWorldHint: false },
       },
       async () => {
-        const rows = this.sql<{ request: string; task_type: string; ts: number }>`SELECT request, task_type, ts FROM prompt_history ORDER BY ts DESC LIMIT 20`;
+        const rows = this.sql<{ request: string; task_type: string }>`SELECT request, task_type FROM prompt_history ORDER BY ts DESC LIMIT 20`;
         if (rows.length === 0) {
           return { content: [{ type: "text", text: "No prompts refined in this session yet." }] };
         }
@@ -239,7 +402,6 @@ export class ProPrompter extends McpAgent {
       },
     );
 
-    // -------- Tool 4: clear session memory (a write action) --------
     this.server.registerTool(
       "clear_memory",
       {
@@ -255,7 +417,6 @@ export class ProPrompter extends McpAgent {
       },
     );
 
-    // -------- Prompt (Claude-only nicer UX): a pickable slash-command --------
     this.server.registerPrompt(
       "pro_prompt",
       {
@@ -265,10 +426,7 @@ export class ProPrompter extends McpAgent {
       },
       ({ request }) => ({
         messages: [
-          {
-            role: "user",
-            content: { type: "text", text: buildRefineAndRun(request, "auto", []) },
-          },
+          { role: "user", content: { type: "text", text: buildRefineAndRun(request, "auto", []) } },
         ],
       }),
     );
@@ -309,15 +467,10 @@ function landingPage(origin: string): string {
 <body>
   <h1>Pro Prompter <span class="ok">✔ live</span></h1>
   <p>A free <strong>Model Context Protocol</strong> server that rewrites your rough requests into
-  FAANG-grade engineered prompts and runs them — using the AI you're already in, at zero extra cost.</p>
+  FAANG-grade engineered prompts and runs them — using the AI you're already in, at zero extra cost.
+  Specialized across 15 task types (coding, writing, design, data, research, and more).</p>
   <p>Add it to Claude or ChatGPT with this URL:</p>
   <p><code>${origin}/mcp</code></p>
-  <h2>What it adds</h2>
-  <ul>
-    <li><code>pro_prompt</code> — engineer your request into a top-tier prompt <em>and execute it</em></li>
-    <li><code>refine_prompt</code> — return just the polished prompt to copy/reuse</li>
-    <li><code>recall_prompts</code> / <code>clear_memory</code> — session memory</li>
-  </ul>
   <p>Say <strong>"Pro Prompter: &lt;your rough idea&gt;"</strong> in a chat to use it. Setup: see the README.</p>
 </body>
 </html>`;
