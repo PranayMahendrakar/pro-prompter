@@ -1,0 +1,27 @@
+{
+  "name": "pro-prompter",
+  "version": "1.0.0",
+  "description": "A free, open MCP server that rewrites rough requests into FAANG-grade prompts and runs them — for Claude & ChatGPT, at zero extra credits.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "agents": "^0.17.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260424.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.105.0"
+  },
+  "overrides": {
+    "@cloudflare/workers-types": "^4.20260424.1"
+  }
+}
