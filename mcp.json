@@ -1,0 +1,5 @@
+﻿{
+  "name": "pro-prompter",
+  "mcpUrl": "https://pro-prompter.mahendrakarpranay.workers.dev/mcp",
+  "tools": ["pro_prompt", "refine_prompt", "recall_prompts", "clear_memory"]
+}
